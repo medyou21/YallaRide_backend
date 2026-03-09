@@ -4,19 +4,31 @@ const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Routes de test
+// Import routes
+const userRoutes = require("./routes/userRoutes");
+const tripRoutes = require("./routes/tripRoutes");
+const reservationRoutes = require("./routes/reservationRoutes");
+const messageRoutes = require("./routes/messageRoutes");
+const reviewRoutes = require("./routes/reviewRoutes");
+
+// Utilisation des routes
+app.use("/api/users", userRoutes);
+app.use("/api/trips", tripRoutes);
+app.use("/api/reservations", reservationRoutes);
+app.use("/api/messages", messageRoutes);
+app.use("/api/reviews", reviewRoutes);
+
+// Test route
 app.get("/", (req, res) => {
   res.send("API YallaRide fonctionne !");
 });
 
-// Connexion à MongoDB
+// Connexion MongoDB
 mongoose.connect(process.env.MONGO_URI, {
-  
+ 
 }).then(() => console.log("Connecté à MongoDB"))
   .catch(err => console.log(err));
 
