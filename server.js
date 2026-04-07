@@ -8,7 +8,7 @@ const jwt = require("jsonwebtoken");
 
 // ---------------- ROUTES ----------------
 const userRoutes = require("./routes/userRoutes");
-const authRoutes = require("./routes/authRoutes"); // Login / Register / Refresh
+const authRoutes = require("./routes/authRoutes");
 const tripRoutes = require("./routes/tripRoutes");
 const reservationRoutes = require("./routes/reservationRoutes");
 const messageRoutes = require("./routes/messageRoutes");
@@ -19,12 +19,11 @@ const authMiddleware = require("./middleware/authMiddleware");
 
 // ---------------- MODELS ----------------
 const Message = require("./models/Message");
-const Reservation = require("./models/Reservation");
 
-// ---------------- INIT APP ----------------
+// ---------------- APP ----------------
 const app = express();
 
-// Middleware
+// ---------------- CORS ----------------
 app.use(
   cors({
     origin: ["http://localhost:3000", "http://192.168.1.12:3000"],
@@ -32,84 +31,94 @@ app.use(
     credentials: true,
   })
 );
+
 app.use(express.json());
 
-// ---------------- SERVER SOCKET.IO ----------------
+// ---------------- SERVER ----------------
 const server = http.createServer(app);
+
+// ---------------- SOCKET.IO ----------------
 const io = new Server(server, {
   cors: {
     origin: ["http://localhost:3000", "http://192.168.1.12:3000"],
     methods: ["GET", "POST"],
     credentials: true,
   },
-  transports: ["websocket"], // 🔹 forcer websocket uniquement
+  transports: ["websocket"],
 });
 
-// Permettre l’accès à io dans les controllers
+// rendre io accessible dans les controllers
 app.set("io", io);
 
 // ---------------- MONGODB ----------------
 mongoose
   .connect(process.env.MONGO_URI)
-  .then(() => console.log("✅ Connecté à MongoDB"))
-  .catch((err) => console.error("❌ Erreur MongoDB :", err));
+  .then(() => console.log("✅ MongoDB connecté"))
+  .catch((err) => console.error("❌ MongoDB error:", err));
 
 // ---------------- ROUTES ----------------
-// Auth routes publiques
+// publiques
 app.use("/api/auth", authRoutes);
-app.use("/api/users", userRoutes); // register/login ici
-
-// Routes protégées
+app.use("/api/users", userRoutes);
+app
+// protégées
 app.use("/api/users", authMiddleware, userRoutes);
 app.use("/api/trips", authMiddleware, tripRoutes);
 app.use("/api/reservations", authMiddleware, reservationRoutes);
 app.use("/api/messages", authMiddleware, messageRoutes);
 app.use("/api/reviews", authMiddleware, reviewRoutes);
 
-app.get("/", (req, res) => res.send("🚗 API YallaRide fonctionne !"));
+app.get("/", (req, res) => {
+  res.send("🚀 YallaRide API + Socket.IO OK");
+});
 
-// ---------------- SOCKET.IO ----------------
-
-// Auth JWT pour Socket.IO
+// ---------------- SOCKET AUTH ----------------
 io.use((socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
-    if (!token) return next(new Error("Auth token manquant"));
+
+    if (!token) return next(new Error("No token"));
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    socket.user = decoded;
 
-    socket.user = decoded; // { id, role }
     next();
   } catch (err) {
     console.error("❌ Socket Auth Error:", err.message);
-    next(new Error("Token invalide"));
+    next(new Error("Auth error"));
   }
 });
 
-// Connexion socket
+// ---------------- SOCKET LOGIC ----------------
+let onlineUsers = new Map();
+
 io.on("connection", (socket) => {
-  console.log("✅ Socket connecté :", socket.id, "User:", socket.user.id);
+  const userId = socket.user.id.toString();
 
-  // 🔹 ROOM UTILISATEUR (IMPORTANT 🔔)
-  socket.join(socket.user.id.toString());
+  console.log("✅ Connected:", userId);
 
-  // 🔹 JOIN ROOM TRAJET
+  // 🔹 utilisateur en ligne
+  onlineUsers.set(userId, socket.id);
+  io.emit("onlineUsers", Array.from(onlineUsers.keys()));
+
+  // 🔹 room user (notifications direct)
+  socket.join(userId);
+
+  // 🔹 rejoindre un trajet
   socket.on("joinRoom", (tripId) => {
     if (!tripId) return;
 
-    const room = tripId.toString();
-    socket.join(room);
-
-    console.log(`📡 User ${socket.user.id} joined trip ${room}`);
+    socket.join(tripId.toString());
+    console.log(`📡 ${userId} a rejoint trip ${tripId}`);
   });
 
-  // 🔹 CHAT TEMPS RÉEL
+  // 🔹 envoyer message
   socket.on("sendMessage", async (data) => {
     try {
-      if (!data.tripId || !data.message) return;
+      if (!data?.tripId || !data?.message) return;
 
       const message = new Message({
-        senderId: socket.user.id,
+        senderId: userId,
         receiverId: data.receiverId,
         tripId: data.tripId,
         message: data.message,
@@ -117,58 +126,70 @@ io.on("connection", (socket) => {
 
       await message.save();
 
-      // 🔥 envoyer à la room du trajet
-      io.to(data.tripId.toString()).emit("receiveMessage", {
+      const payload = {
         ...message.toObject(),
         senderName: data.senderName || "Utilisateur",
-      });
+      };
+
+      console.log("📩 Message:", payload);
+
+      io.to(data.tripId.toString()).emit("receiveMessage", payload);
 
     } catch (err) {
       console.error("❌ sendMessage error:", err.message);
     }
   });
 
-  // 🔹 NOTIFICATION NOUVELLE RESERVATION
+  // 🔹 typing
+  socket.on("typing", ({ tripId }) => {
+    if (!tripId) return;
+
+    socket
+      .to(tripId.toString())
+      .emit("userTyping", { userId });
+  });
+
+  socket.on("stopTyping", ({ tripId }) => {
+    if (!tripId) return;
+
+    socket
+      .to(tripId.toString())
+      .emit("userStopTyping", { userId });
+  });
+
+  // 🔹 nouvelles réservations
   socket.on("newReservation", (reservation) => {
-    try {
-      if (!reservation?.tripId) return;
+    if (!reservation?.tripId) return;
 
-      io.to(reservation.tripId.toString()).emit("newReservation", reservation);
-
-    } catch (err) {
-      console.error("❌ newReservation error:", err.message);
-    }
+    io.to(reservation.tripId.toString()).emit(
+      "newReservation",
+      reservation
+    );
   });
 
-  // 🔹 CHANGEMENT STATUS
+  // 🔹 changement statut réservation
   socket.on("reservationStatusChanged", (reservation) => {
-    try {
-      if (!reservation?.passengerId) return;
+    if (!reservation?.passengerId) return;
 
-      // 🔔 envoyer direct au passager
-      io.to(reservation.passengerId.toString()).emit(
-        "reservationStatusChanged",
-        reservation
-      );
-
-    } catch (err) {
-      console.error("❌ status error:", err.message);
-    }
+    io.to(reservation.passengerId.toString()).emit(
+      "reservationStatusChanged",
+      reservation
+    );
   });
 
-  // 🔹 DECONNEXION
-  socket.on("disconnect", (reason) => {
-    console.log(`❌ Socket disconnected (${socket.user.id}) :`, reason);
-  });
+  // 🔹 disconnect
+  socket.on("disconnect", () => {
+    console.log("❌ Disconnected:", userId);
 
-  // 🔹 ERREUR SOCKET
-  socket.on("error", (err) => {
-    console.error("❌ Socket error :", err);
+    onlineUsers.delete(userId);
+
+    io.emit("onlineUsers", Array.from(onlineUsers.keys()));
   });
 });
 
-// ---------------- SERVER ----------------
+// ---------------- START ----------------
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Serveur lancé sur http://0.0.0.0:${PORT}`)
-);
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+});
